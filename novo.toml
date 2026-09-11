@@ -1,0 +1,36 @@
+[package]
+name        = "l2cap-nv"
+version     = "0.0.1"
+description = "The Bluetooth L2CAP layer with no radio: basic-mode frames to and from bytes, the LE fixed channels, reassembly of a frame split across ACL packets, and the signalling commands a peripheral meets.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `core`: the whole surface is arithmetic over bytes the caller already
+# holds.  Reassembly is a value the caller owns rather than a buffer
+# this package hides, which is what lets the same code run in a
+# controller's receive path and in a capture tool.
+layer       = "core"
+
+category    = "networking"
+
+tags        = ["bluetooth", "ble", "l2cap", "codec", "sans-io", "reassembly", "b-frame", "signalling", "embedded"]
+repository  = "https://github.com/novolang/l2cap-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+[docs.pages]
+"README.md" = "L2CAP channels and fragments, without a radio"
+
+[dependencies]
+# The ACL types.  An L2CAP frame arrives inside HCI ACL data and leaves
+# the same way, so `fragment` and `feed_acl` speak hci-codec-nv's
+# `AclData` and `Boundary` rather than declaring a second spelling of
+# the same twelve bits.  Under the caret rule `^0.0.2` means exactly
+# 0.0.2: a `0.0.x` version has no compatible neighbours.
+hci-codec-nv = "^0.0.2"

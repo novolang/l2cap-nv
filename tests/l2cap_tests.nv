@@ -1,0 +1,323 @@
+// tests/l2cap_tests.nv — the API tests, written against the signatures.
+//
+// They COMPILE today and they FAIL at run, with `not implemented:
+// l2cap.<fn>` from the `todo()` that is each body.  That is the
+// expected state of an interface release: the compiler has checked
+// every signature, every type and every effect row, and nothing else
+// has been checked because there is nothing else yet.
+//
+// The byte strings are the specification's own, Core Vol 3 Part A: the
+// § 3.1 basic-mode header, the § 4.20 Connection Parameter Update
+// Request and its § 4.21 response.  An implementation lane should take
+// them from the Core Specification rather than from another stack.
+
+use std.test
+use l2cap
+
+// An ATT Read Request for handle 0x0001, as a frame on CID 0x0004.
+//
+//   03 00     payload length = 3
+//   04 00     CID = ATT
+//   0A 01 00  ATT_READ_REQ, handle 0x0001
+fn att_read_req_frame() -> [u8]
+    [0x03 as u8, 0x00 as u8, 0x04 as u8, 0x00 as u8,
+     0x0A as u8, 0x01 as u8, 0x00 as u8]
+
+// The Connection Parameter Update Request a peripheral sends to ask for
+// 7.5 ms to 50 ms with no latency and a 5 s supervision timeout.
+//
+//   12        Connection Parameter Update Request
+//   01        identifier
+//   08 00     parameter length = 8
+//   06 00     interval min  = 6    (7.5 ms)
+//   28 00     interval max  = 40   (50 ms)
+//   00 00     latency       = 0
+//   F4 01     timeout       = 500  (5 s)
+fn conn_param_update_payload() -> [u8]
+    [0x12 as u8, 0x01 as u8, 0x08 as u8, 0x00 as u8,
+     0x06 as u8, 0x00 as u8, 0x28 as u8, 0x00 as u8,
+     0x00 as u8, 0x00 as u8, 0xF4 as u8, 0x01 as u8]
+
+@test
+fn test_the_fixed_channels_are_the_specification_s()
+    // Real today: the constants are the one part of an interface that
+    // needs no body.
+    test.assert_eq(l2cap.CID_ATT, 0x0004)
+    test.assert_eq(l2cap.CID_LE_SIGNALLING, 0x0005)
+    test.assert_eq(l2cap.CID_SMP, 0x0006)
+    test.assert_eq(l2cap.HEADER_LEN, 4)
+    test.assert_eq(l2cap.MTU_LE_MINIMUM, 23)
+
+@test
+fn test_a_cid_and_its_channel_round_trip()
+    match l2cap.channel_of(0x0004)
+        AttributeChannel => test.assert(true)
+        _                => test.fail("0x0004 is the ATT channel and nothing else")
+    match l2cap.channel_of(0x0006)
+        SecurityManagerChannel => test.assert(true)
+        _                      => test.fail("0x0006 is SMP's channel")
+    test.assert_eq(l2cap.cid_of(AttributeChannel), 0x0004)
+    test.assert_eq(l2cap.cid_of(SignallingChannel), 0x0005)
+
+@test
+fn test_a_dynamic_cid_keeps_its_number()
+    // 0x0040 is the first credit-based channel.  This release does not
+    // model the procedure that allocates one, and it still has to say
+    // which CID arrived rather than losing it.
+    match l2cap.channel_of(0x0040)
+        DynamicChannel(cid) => test.assert_eq(cid, 0x0040)
+        _                   => test.fail("0x0040 and up are the dynamic range")
+    test.assert_eq(l2cap.cid_of(DynamicChannel(0x0040)), 0x0040)
+    match l2cap.channel_of(0x0001)
+        ForeignChannel(cid) => test.assert_eq(cid, 0x0001)
+        _                   => test.fail("0x0001 is BR/EDR's signalling channel, not LE's")
+
+@test
+fn test_a_frame_encodes_to_the_specification_s_bytes()
+    let frame = L2capFrame { cid: 0x0004, payload: [0x0A as u8, 0x01 as u8, 0x00 as u8] }
+    let wire = l2cap.encode_frame(frame)
+    test.assert_eq(list.len(wire), 7)
+    test.assert_eq(wire[0] as Int, 0x03)   // length lo — the PAYLOAD's length
+    test.assert_eq(wire[1] as Int, 0x00)   // length hi
+    test.assert_eq(wire[2] as Int, 0x04)   // CID lo
+    test.assert_eq(wire[3] as Int, 0x00)   // CID hi
+    test.assert_eq(wire[4] as Int, 0x0A)
+
+@test
+fn test_a_frame_round_trips()
+    match l2cap.decode_frame(att_read_req_frame())
+        Err(_)   => test.fail("seven bytes are one whole frame")
+        Ok(back) =>
+            test.assert_eq(back.cid, 0x0004)
+            test.assert_eq(list.len(back.payload), 3)
+            test.assert_eq(back.payload[0] as Int, 0x0A)
+
+@test
+fn test_a_buffer_shorter_than_the_header_is_refused()
+    match l2cap.decode_frame([0x03 as u8, 0x00 as u8, 0x04 as u8])
+        Ok(_)  => test.fail("three bytes cannot carry a four-byte header")
+        Err(e) =>
+            match e
+                L2capTruncated(have, need) =>
+                    test.assert_eq(have, 3)
+                    test.assert_eq(need, 4)
+                _                          => test.fail("a short buffer is L2capTruncated")
+
+@test
+fn test_a_length_field_that_lies_is_refused()
+    // Header claims five payload bytes; two are present.
+    let bad: [u8] = [0x05 as u8, 0x00 as u8, 0x04 as u8, 0x00 as u8,
+                     0xAA as u8, 0xBB as u8]
+    match l2cap.decode_frame(bad)
+        Ok(_)  => test.fail("the length field and the buffer disagree")
+        Err(e) =>
+            match e
+                L2capLengthMismatch(declared, actual) =>
+                    test.assert_eq(declared, 5)
+                    test.assert_eq(actual, 2)
+                _                                     => test.fail("a lying length field is L2capLengthMismatch")
+
+@test
+fn test_a_scan_separates_waiting_from_wrong()
+    match l2cap.scan(att_read_req_frame())
+        L2capPartial  => test.fail("seven bytes are the whole of this frame")
+        L2capWhole(n) => test.assert_eq(n, 7)
+    // Two bytes: not even the length field is complete.
+    match l2cap.scan([0x03 as u8, 0x00 as u8])
+        L2capPartial  => test.assert(true)
+        L2capWhole(_) => test.fail("two bytes cannot be a whole frame")
+
+@test
+fn test_a_frame_that_fits_one_acl_packet_makes_one()
+    let frame = L2capFrame { cid: 0x0004, payload: [0x0A as u8, 0x01 as u8, 0x00 as u8] }
+    let packets = l2cap.fragment(frame, 0x0040, 27)
+    test.assert_eq(list.len(packets), 1)
+    let first = packets[0]
+    test.assert_eq(first.handle, 0x0040)
+    match first.boundary
+        FirstFlushable => test.assert(true)
+        _              => test.fail("LE starts a message with FirstFlushable")
+
+@test
+fn test_a_frame_larger_than_the_acl_packet_is_split()
+    // 30 payload bytes plus the four-byte header is 34; an ACL packet
+    // of 27 carries 27 of them and the rest follow.
+    var payload: [u8] = []
+    for i in 0..30
+        payload = list.append(payload, [0x41 as u8])
+    let frame = L2capFrame { cid: 0x0004, payload: payload }
+    let packets = l2cap.fragment(frame, 0x0040, 27)
+    test.assert_eq(list.len(packets), 2)
+    match packets[0].boundary
+        FirstFlushable => test.assert(true)
+        _              => test.fail("the first packet starts the message")
+    match packets[1].boundary
+        Continuation => test.assert(true)
+        _            => test.fail("every packet after the first continues it")
+    test.assert_eq(list.len(packets[0].payload), 27)
+    test.assert_eq(list.len(packets[1].payload), 7)
+
+@test
+fn test_a_reassembler_starts_empty_at_the_le_minimum()
+    let r = l2cap.reassembler()
+    test.assert_eq(l2cap.pending_len(r), 0)
+    test.assert_eq(l2cap.mtu(r), 23)
+
+@test
+fn test_the_mtu_is_the_caller_s_and_survives_a_reset()
+    let r = l2cap.reassembler_with_mtu(517)
+    test.assert_eq(l2cap.mtu(r), 517)
+    test.assert_eq(l2cap.mtu(l2cap.set_mtu(r, 247)), 247)
+    // A disconnection drops the half-frame and keeps the number.
+    test.assert_eq(l2cap.mtu(l2cap.reset(r)), 517)
+    test.assert_eq(l2cap.pending_len(l2cap.reset(r)), 0)
+
+@test
+fn test_a_whole_frame_in_one_acl_packet_comes_straight_back()
+    let r = l2cap.reassembler()
+    let acl = AclData {
+        handle: 0x0040,
+        boundary: FirstFlushable,
+        broadcast: 0,
+        payload: att_read_req_frame() }
+    let step = l2cap.feed_acl(r, acl)
+    match step.frame
+        None    => test.fail("a whole frame was fed")
+        Some(f) =>
+            test.assert_eq(f.cid, 0x0004)
+            test.assert_eq(list.len(f.payload), 3)
+    match step.error
+        None    => test.assert(true)
+        Some(_) => test.fail("nothing was wrong with that packet")
+
+@test
+fn test_a_frame_split_between_the_length_bytes_reassembles()
+    // The hard case: the split lands INSIDE the length field, so the
+    // reassembler cannot read a header from the first packet at all.
+    let r = l2cap.reassembler()
+    let first = l2cap.feed_payload(r, FirstFlushable, [0x03 as u8])
+    match first.frame
+        None    => test.assert(true)
+        Some(_) => test.fail("one byte is not a frame")
+    test.assert_eq(l2cap.pending_len(first.reassembler), 1)
+    let rest: [u8] = [0x00 as u8, 0x04 as u8, 0x00 as u8,
+                      0x0A as u8, 0x01 as u8, 0x00 as u8]
+    let second = l2cap.feed_payload(first.reassembler, Continuation, rest)
+    match second.frame
+        None    => test.fail("the second fragment completes the frame")
+        Some(f) => test.assert_eq(f.cid, 0x0004)
+
+@test
+fn test_a_continuation_with_nothing_in_progress_is_an_error()
+    let r = l2cap.reassembler()
+    let step = l2cap.feed_payload(r, Continuation, [0xAA as u8, 0xBB as u8])
+    match step.frame
+        None    => test.assert(true)
+        Some(_) => test.fail("a continuation alone is not a frame")
+    match step.error
+        None    => test.fail("a continuation with no frame in progress is wrong, not incomplete")
+        Some(e) =>
+            match e
+                L2capOrphanContinuation => test.assert(true)
+                _                       => test.fail("the refusal names the orphan continuation")
+
+@test
+fn test_a_frame_past_the_mtu_is_refused_at_the_first_packet()
+    let r = l2cap.reassembler_with_mtu(23)
+    // A length field of 512 on a link that agreed 23.
+    let step = l2cap.feed_payload(r, FirstFlushable,
+                                  [0x00 as u8, 0x02 as u8, 0x04 as u8, 0x00 as u8])
+    match step.error
+        None    => test.fail("512 is past a 23-byte MTU and the alarm belongs here")
+        Some(e) =>
+            match e
+                L2capOverMtu(declared, limit) =>
+                    test.assert_eq(declared, 512)
+                    test.assert_eq(limit, 23)
+                _                             => test.fail("the refusal names the MTU it went past")
+
+@test
+fn test_a_second_frame_stays_in_until_it_is_taken()
+    let r = l2cap.reassembler()
+    let two = list.append(att_read_req_frame(), att_read_req_frame())
+    let first = l2cap.feed_payload(r, FirstFlushable, two)
+    match first.frame
+        None    => test.fail("the first frame is whole")
+        Some(_) => test.assert(true)
+    test.assert_eq(l2cap.pending_len(first.reassembler), 7)
+    let second = l2cap.take(first.reassembler)
+    match second.frame
+        None    => test.fail("the second frame was buffered")
+        Some(f) => test.assert_eq(f.cid, 0x0004)
+
+@test
+fn test_a_connection_parameter_update_request_round_trips()
+    match l2cap.decode_signal(conn_param_update_payload())
+        Err(_)  => test.fail("twelve bytes are one whole signalling command")
+        Ok(sig) =>
+            match sig
+                ConnectionParameterUpdateRequest(id, imin, imax, latency, timeout) =>
+                    test.assert_eq(id, 0x01)
+                    test.assert_eq(imin, 6)
+                    test.assert_eq(imax, 40)
+                    test.assert_eq(latency, 0)
+                    test.assert_eq(timeout, 500)
+                _                                                                  => test.fail("0x12 is the Connection Parameter Update Request")
+
+@test
+fn test_a_signalling_command_encodes_to_its_own_bytes()
+    let sig = ConnectionParameterUpdateRequest(0x01, 6, 40, 0, 500)
+    let wire = l2cap.encode_signal(sig)
+    test.assert_eq(list.len(wire), 12)
+    test.assert_eq(wire[0] as Int, 0x12)   // code
+    test.assert_eq(wire[1] as Int, 0x01)   // identifier
+    test.assert_eq(wire[2] as Int, 0x08)   // parameter length lo
+    test.assert_eq(wire[3] as Int, 0x00)
+    test.assert_eq(l2cap.signal_code(sig), 0x12)
+    test.assert_eq(l2cap.signal_identifier(sig), 0x01)
+
+@test
+fn test_a_response_says_whether_the_central_accepted()
+    // 13 01 02 00 00 00 — accepted.
+    let accepted: [u8] = [0x13 as u8, 0x01 as u8, 0x02 as u8, 0x00 as u8,
+                          0x00 as u8, 0x00 as u8]
+    match l2cap.decode_signal(accepted)
+        Err(_)  => test.fail("six bytes are one whole response")
+        Ok(sig) =>
+            match sig
+                ConnectionParameterUpdateResponse(id, result) =>
+                    test.assert_eq(id, 0x01)
+                    test.assert_eq(result, l2cap.CONN_PARAM_ACCEPTED)
+                _                                             => test.fail("0x13 is the Connection Parameter Update Response")
+
+@test
+fn test_a_signal_goes_out_on_the_signalling_channel()
+    let frame = l2cap.signal_frame(ConnectionParameterUpdateResponse(0x01, 0x0000))
+    test.assert_eq(frame.cid, l2cap.CID_LE_SIGNALLING)
+
+@test
+fn test_a_signalling_payload_shorter_than_its_header_is_refused()
+    match l2cap.decode_signal([0x12 as u8, 0x01 as u8])
+        Ok(_)  => test.fail("two bytes cannot carry a four-byte command header")
+        Err(e) =>
+            match e
+                L2capSignalTruncated(have, need) =>
+                    test.assert_eq(have, 2)
+                    test.assert_eq(need, 4)
+                _                                => test.fail("a short signalling payload is L2capSignalTruncated")
+
+@test
+fn test_a_signalling_code_this_release_does_not_model_is_named()
+    // 0x14 is the LE Credit Based Connection Request.  It is a real
+    // command and this release does not model it, and saying which code
+    // arrived is the difference between a consumer filing a bug and a
+    // consumer guessing.
+    match l2cap.decode_signal([0x14 as u8, 0x01 as u8, 0x0A as u8, 0x00 as u8,
+                               0x80 as u8, 0x00 as u8, 0x40 as u8, 0x00 as u8,
+                               0x17 as u8, 0x00 as u8, 0x17 as u8, 0x00 as u8,
+                               0x0A as u8, 0x00 as u8])
+        Ok(_)  => test.fail("the credit-based commands are not modelled here")
+        Err(e) =>
+            match e
+                L2capUnknownSignal(code) => test.assert_eq(code, 0x14)
+                _                        => test.fail("the refusal names the code it did not know")

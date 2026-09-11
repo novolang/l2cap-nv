@@ -1,0 +1,384 @@
+// l2cap — the Bluetooth Logical Link Control and Adaptation Protocol,
+// with no radio and no controller under it.
+//
+// Every body is a `todo()`.  The signatures and the effect rows are the
+// design, and the compiler checks them as claims; see the README for
+// the stamp.
+//
+// Core Vol 3 Part A.  L2CAP is the layer that turns a connection's
+// stream of ACL packets into channels: it puts a length and a channel
+// identifier in front of a payload, splits a frame that does not fit an
+// ACL packet, and puts the pieces back together at the far end.  On LE
+// that is three fixed channels and one signalling conversation, and
+// none of it touches a radio.
+//
+// All multi-byte fields are little-endian, which is the Bluetooth
+// convention throughout.
+//
+// WHAT THIS PACKAGE DOES NOT HOLD: a buffer belonging to a controller.
+// Reassembly state is `L2capReassembler`, a value the caller owns one
+// of per connection; this package has no mutable state of its own and
+// no address it writes to.
+//
+// `AclData` and `Boundary` are hci-codec-nv's, named in `fragment`,
+// `feed_acl` and `feed_payload`.  There is no `use hci_codec` line
+// because a type's identity is its NAME across the whole assembly: the
+// dependency in novo.toml is what brings the declarations in, and a
+// `use` would only be needed to reach that package's functions, which
+// this one does not call.
+
+// ── The fixed channels (§ 2.1, Table 2.1) ───────────────────────────
+
+// The Attribute Protocol's channel.
+pub const CID_ATT = 0x0004
+
+// The LE signalling channel, which is where a peripheral asks for a
+// different connection interval.
+pub const CID_LE_SIGNALLING = 0x0005
+
+// The Security Manager's channel, which is smp-nv's `CID`.
+pub const CID_SMP = 0x0006
+
+// The length and CID header in front of every basic-mode frame: two
+// bytes of payload length, two of channel identifier.
+pub const HEADER_LEN = 4
+
+// The smallest MTU an LE device may use (§ 5.1).  A peer that has not
+// exchanged an MTU is assumed to be at this one, which is why it is
+// also what `reassembler()` starts at.
+pub const MTU_LE_MINIMUM = 23
+
+// Which channel a CID names.
+//
+// The three LE fixed channels are variants because a caller dispatches
+// on them; everything else keeps its number, because this package has
+// no opinion about a channel it does not define.
+pub enum L2capChannel
+    AttributeChannel
+    SignallingChannel
+    SecurityManagerChannel
+    // 0x0040 and up: allocated by the LE credit-based procedure, which
+    // this release does not model.  See the README.
+    DynamicChannel(cid: Int)
+    // A CID this transport does not carry — 0x0000, or one of BR/EDR's.
+    ForeignChannel(cid: Int)
+
+// One basic-mode frame: a channel and its payload (§ 3.1).
+//
+// The length field is not a field, because it is `payload`'s length and
+// a struct that carried both could disagree with itself.
+// `encode_frame` writes it.
+pub struct L2capFrame
+    cid: Int
+    payload: [u8]
+
+// What a scan of a partial buffer concluded.
+//
+// Separate from `L2capError` for the reason hci-codec-nv separates
+// `Scan` from `DecodeError`: a frame that has not all arrived is the
+// normal case on a connection, and an error type that also meant "wait"
+// would make every caller remember which value was which.
+pub enum L2capScan
+    // The buffer holds a prefix: either the four header bytes are not
+    // all there, or they are and the payload is still arriving.
+    L2capPartial
+    // A whole frame is at the front of the buffer, `length` bytes
+    // including the four header bytes.
+    L2capWhole(length: Int)
+
+// Why a frame or a signalling command could not be read.
+//
+// None of these means "wait for more bytes" — that is `L2capPartial`.
+// An `L2capError` is something that arrived complete and was wrong,
+// which on a connection means the peer or the controller is at fault.
+pub enum L2capError
+    // Fewer bytes than the four-byte header needs.
+    L2capTruncated(have: Int, need: Int)
+    // The header's length field and the bytes present disagree.
+    L2capLengthMismatch(declared: Int, actual: Int)
+    // A frame larger than the MTU the caller set.  The MTU is a local
+    // policy, so this is the caller's number and not the peer's.
+    L2capOverMtu(declared: Int, mtu: Int)
+    // A continuation ACL packet arrived with no frame in progress.
+    L2capOrphanContinuation
+    // A starting ACL packet arrived while `pending` bytes of the
+    // previous frame were still owed.  The half-frame is dropped and
+    // this says how much of it was lost, because a link that does this
+    // has a controller problem and the size is the evidence.
+    L2capInterruptedFrame(pending: Int)
+    // A signalling payload shorter than the four-byte command header.
+    L2capSignalTruncated(have: Int, need: Int)
+    // A signalling command code this release does not model.
+    L2capUnknownSignal(code: Int)
+    // A signalling command whose own length field and parameters
+    // disagree.
+    L2capSignalLengthMismatch(code: Int, declared: Int, actual: Int)
+
+// What went wrong, in words, for a caller that logs rather than
+// branches.
+//
+// `Result<_, L2capError>` requires it: SPEC § 3.4 admits a `Result`
+// error type only if it implements `Error`.
+impl Error for L2capError
+    fn message(self) -> Str
+        todo("l2cap.L2capError.message")
+
+// ── Channels ────────────────────────────────────────────────────────
+
+// The channel a CID names.
+//
+// ```novo
+// use l2cap
+//
+// fn main() [io]
+//     match l2cap.channel_of(0x0004)
+//         AttributeChannel       => println("the attribute protocol")
+//         SignallingChannel      => println("signalling")
+//         SecurityManagerChannel => println("pairing")
+//         DynamicChannel(cid)    => println("credit-based, cid ${cid}")
+//         ForeignChannel(cid)    => println("not a LE channel: ${cid}")
+// ```
+pub fn channel_of(cid: Int) -> L2capChannel
+    todo("l2cap.channel_of")
+
+// The CID a channel is.
+//
+// A `DynamicChannel` or a `ForeignChannel` returns the number it was
+// built with, so this and `channel_of` round-trip for every CID.
+pub fn cid_of(channel: L2capChannel) -> Int
+    todo("l2cap.cid_of")
+
+// ── Frames ──────────────────────────────────────────────────────────
+
+// A frame as its wire bytes: two bytes of little-endian payload length,
+// two of little-endian CID, then the payload.
+pub fn encode_frame(frame: L2capFrame) -> [u8]
+    todo("l2cap.encode_frame")
+
+// Read one whole frame from the front of `bytes`.
+//
+// Refuses a buffer that carries more than one frame's worth: the length
+// field and the buffer must agree exactly, because a caller that meant
+// "the first frame of many" wants `scan` and a slice, and silently
+// ignoring a tail is how a stack loses a notification.
+pub fn decode_frame(bytes: [u8]) -> Result<L2capFrame, L2capError>
+    todo("l2cap.decode_frame")
+
+// How much of the front of `buf` is one frame.
+//
+// Reads the length field and adds the header; it does not copy and it
+// does not look at the payload.
+//
+// ```novo
+// use l2cap
+//
+// fn main() [io]
+//     // An ATT Read Request: three payload bytes on CID 0x0004.
+//     let buf: [u8] = [0x03 as u8, 0x00 as u8, 0x04 as u8, 0x00 as u8,
+//                      0x0A as u8, 0x01 as u8, 0x00 as u8]
+//     match l2cap.scan(buf)
+//         L2capPartial  => println("keep the bytes and wait")
+//         L2capWhole(n) => println("${n} bytes are one frame")
+// ```
+pub fn scan(buf: [u8]) -> L2capScan
+    todo("l2cap.scan")
+
+// ── Fragmentation across ACL packets (§ 7.2) ────────────────────────
+
+// A frame as the ACL packets that carry it, largest first fit.
+//
+// `handle` is the connection handle the controller gave, and `acl_mtu`
+// is the controller's ACL data packet length — the one an
+// `LE_Read_Buffer_Size` command returns, NOT the L2CAP MTU.  The first
+// packet is `FirstFlushable`, which is what LE uses for the start of a
+// message, and the rest are `Continuation`.
+//
+// A frame that fits in one packet returns one packet, so a caller never
+// needs a special case for the common size.
+pub fn fragment(frame: L2capFrame, handle: Int, acl_mtu: Int) -> [AclData]
+    todo("l2cap.fragment")
+
+// ── Reassembly ──────────────────────────────────────────────────────
+//
+// An ACL packet may split a frame ANYWHERE, including between the two
+// bytes of the length field, so a reassembler cannot assume it has a
+// header to read.  The state between "an ACL packet arrived" and "here
+// is a frame" is this value: FEED it what the controller handed you,
+// then DRAIN it until it stops producing.
+
+// Bytes received on one connection and not yet handed back as a frame.
+//
+// Opaque.  A caller that reaches into it has coupled itself to a
+// buffering decision this package intends to change; `pending_len` and
+// `mtu` are the two facts a supervisor actually needs.
+pub struct L2capReassembler
+    pending: [u8]
+    mtu: Int
+
+// A reassembler and the one frame that came out of it, if one did.
+//
+// A struct rather than a tuple because a tuple's components come out
+// only through `match`, which reads badly for a value whose two halves
+// are used at different places — the caller reassigns one and
+// dispatches on the other.
+pub struct L2capStep
+    reassembler: L2capReassembler
+    frame: ?L2capFrame
+    error: ?L2capError
+
+// A reassembler at the LE minimum MTU and holding nothing.
+pub fn reassembler() -> L2capReassembler
+    todo("l2cap.reassembler")
+
+// A reassembler holding nothing, at the MTU the caller sets.
+//
+// The MTU is the CALLER's: it is what an ATT exchange or a signalling
+// negotiation settled on, and this package neither performs that
+// exchange nor remembers it happened.  A frame larger than this is
+// refused with `L2capOverMtu` rather than buffered, because the alarm
+// a runaway length field should raise is at the first packet and not at
+// the sixty-fifth kilobyte.
+pub fn reassembler_with_mtu(mtu: Int) -> L2capReassembler
+    todo("l2cap.reassembler_with_mtu")
+
+// The MTU this reassembler refuses frames above.
+pub fn mtu(r: L2capReassembler) -> Int
+    todo("l2cap.mtu")
+
+// The same reassembler at a new MTU, keeping whatever it is holding.
+//
+// This is what a caller calls the moment an ATT MTU exchange or a
+// signalling response settles, and keeping the pending bytes is
+// deliberate: the MTU changed between frames, not inside one.
+pub fn set_mtu(r: L2capReassembler, mtu: Int) -> L2capReassembler
+    todo("l2cap.set_mtu")
+
+// Feed one ACL packet, and take a frame if it completed one.
+//
+// Drains ONE frame.  A packet that completes two — which a controller
+// with a large ACL buffer can send — leaves the second inside, and
+// `take` is what gets it.
+//
+// `error` is set instead of `frame` when the packet was wrong rather
+// than incomplete: a `Continuation` with nothing in progress, a start
+// that interrupted a frame, or a length field past the MTU.  Both may
+// be `None`, which is the ordinary "more is due" answer.
+pub fn feed_acl(r: L2capReassembler, acl: AclData) -> L2capStep
+    todo("l2cap.feed_acl")
+
+// Feed raw payload bytes with the boundary said separately.
+//
+// The shape a controller has: it holds the twelve header bits in
+// registers and the payload in a DMA buffer, and building an `AclData`
+// to pass them would be an allocation on the receive path.  Feeding a
+// `FirstFlushable` or `FirstNonFlushable` boundary starts a frame; a
+// `Continuation` adds to the one in progress.
+pub fn feed_payload(r: L2capReassembler, boundary: Boundary, payload: [u8]) -> L2capStep
+    todo("l2cap.feed_payload")
+
+// Take a frame if a whole one is already buffered, adding nothing.
+//
+// `frame` is `None` when the buffer holds a prefix, and the reassembler
+// comes back unchanged.
+pub fn take(r: L2capReassembler) -> L2capStep
+    todo("l2cap.take")
+
+// How many bytes the reassembler is holding.
+//
+// For a caller that bounds its own buffering: a link sent a truncated
+// frame will sit on it until the connection ends, and this is how a
+// supervisor notices.
+pub fn pending_len(r: L2capReassembler) -> Int
+    todo("l2cap.pending_len")
+
+// A reassembler holding nothing, at the MTU this one had.
+//
+// What a caller calls on a disconnection: the half-frame belonged to a
+// connection that no longer exists, and carrying it into the next one
+// would deliver a peer's bytes to a different peer.
+pub fn reset(r: L2capReassembler) -> L2capReassembler
+    todo("l2cap.reset")
+
+// ── The signalling channel (§ 4) ────────────────────────────────────
+
+// Command Reject.
+pub const SIG_COMMAND_REJECT = 0x01
+
+// Disconnection Request.
+pub const SIG_DISCONNECTION_REQUEST = 0x06
+
+// Disconnection Response.
+pub const SIG_DISCONNECTION_RESPONSE = 0x07
+
+// Connection Parameter Update Request.
+pub const SIG_CONN_PARAM_UPDATE_REQUEST = 0x12
+
+// Connection Parameter Update Response.
+pub const SIG_CONN_PARAM_UPDATE_RESPONSE = 0x13
+
+// The Connection Parameter Update Response result meaning the central
+// accepted the peripheral's parameters (§ 4.20).
+pub const CONN_PARAM_ACCEPTED = 0x0000
+
+// The same response's rejection.
+pub const CONN_PARAM_REJECTED = 0x0001
+
+// One signalling command (§ 4).
+//
+// Every command carries its own `identifier`, the byte that pairs a
+// response with its request, because the pairing is the caller's to
+// keep: this package has no timer and no outstanding-request table.
+//
+// This is the set a LE PERIPHERAL meets.  The credit-based connection
+// commands (0x14 to 0x18) are not here; the README says why and what a
+// consumer who needs them should expect.
+pub enum L2capSignal
+    // The peer refused a command it could not parse or did not know
+    // (§ 4.1).  `reason` is 0x0000 for a command it did not understand,
+    // 0x0001 for a signalling MTU it could not meet, 0x0002 for an
+    // invalid CID; `data` is the reason's parameters, which differ per
+    // reason and are not split out here.
+    CommandReject(identifier: Int, reason: Int, data: [u8])
+    // A peripheral asking the central for a different connection
+    // interval (§ 4.20).  Intervals and the timeout are in the
+    // specification's own units — 1.25 ms for an interval, 10 ms for
+    // the timeout — and this package does not convert them, because a
+    // conversion to milliseconds loses the value the controller wants.
+    ConnectionParameterUpdateRequest(identifier: Int, interval_min: Int, interval_max: Int,
+                                     latency: Int, timeout: Int)
+    // The central's answer (§ 4.21).  `result` is `CONN_PARAM_ACCEPTED`
+    // or `CONN_PARAM_REJECTED`.
+    ConnectionParameterUpdateResponse(identifier: Int, result: Int)
+    // Tear a channel down (§ 4.6).  Only meaningful for a channel that
+    // was created, so on a fixed-channel-only link this arrives from a
+    // peer that thinks it opened one.
+    DisconnectionRequest(identifier: Int, destination_cid: Int, source_cid: Int)
+    // The acknowledgement of one (§ 4.7).
+    DisconnectionResponse(identifier: Int, destination_cid: Int, source_cid: Int)
+
+// A signalling command as the payload of a frame on `CID_LE_SIGNALLING`.
+//
+// One code byte, one identifier byte, two bytes of little-endian
+// parameter length, then the parameters.  The result is the PAYLOAD:
+// wrap it with `signal_frame` to get something `encode_frame` takes.
+pub fn encode_signal(signal: L2capSignal) -> [u8]
+    todo("l2cap.encode_signal")
+
+// Read a signalling command from the payload of a signalling frame.
+//
+// `payload` is what `L2capFrame.payload` holds for a frame on
+// `CID_LE_SIGNALLING`; the four-byte L2CAP header is already off.
+pub fn decode_signal(payload: [u8]) -> Result<L2capSignal, L2capError>
+    todo("l2cap.decode_signal")
+
+// The command code a signal carries.
+pub fn signal_code(signal: L2capSignal) -> Int
+    todo("l2cap.signal_code")
+
+// The identifier byte a signal carries.
+pub fn signal_identifier(signal: L2capSignal) -> Int
+    todo("l2cap.signal_identifier")
+
+// A signal as a frame on the signalling channel, ready to encode.
+pub fn signal_frame(signal: L2capSignal) -> L2capFrame
+    todo("l2cap.signal_frame")

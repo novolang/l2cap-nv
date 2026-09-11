@@ -1,0 +1,96 @@
+// tests/embedded_probe.nv — the package's device claim, as a program
+// that either builds for a Cortex-M or does not.
+//
+// The shard audit's `core-embedded` row copies this and the modules its
+// `use` lines reach into a package of their own and runs
+//
+//   novo build --target=nrf52-qemu src/probe.nv
+//
+// which produces a real Cortex-M4 ELF or fails.  For L2CAP the claim is
+// the whole point of splitting the layer out: the same reassembler runs
+// in a controller's receive path, in a host stack on a laptop, and in a
+// capture tool, and one that could not compile for the first would not
+// be worth having as a package.
+//
+// It BUILDS; it does not run.  Every function it calls is a `todo()`
+// today, so a device that executed this would panic on the first line
+// of `main`.  What is being checked is the TIER: `--target=nrf52-qemu`
+// stamps `@tier(embedded)` on every function it compiles, so the
+// checker walks the module and refuses a `Str` concatenation, a `Bytes`
+// call or an unbounded `while` wherever the implementation later puts
+// one.
+//
+// WHERE THE BYTES COME FROM.  At `@tier(embedded)` a list literal is an
+// implicit heap allocation and a boxed struct literal is a heap cell,
+// so a probe cannot write its own test vector down — the bytes and the
+// values have to ARRIVE, which on a device they do, from a DMA buffer
+// and from the controller's ACL headers.  `received_payload` and
+// `received_acl` stand where that arrival is; their bodies are `todo()`
+// like everything else here.
+
+// `AclData` and `Boundary` come from hci-codec-nv through l2cap-nv's
+// dependency; a type's identity is its name across the assembly, so
+// naming the package is not needed to spell them.
+use l2cap
+
+// The ACL payload a controller's receive path hands up.
+fn received_payload() -> [u8]
+    todo("probe.received_payload")
+
+// One ACL packet as the controller reported it.
+fn received_acl() -> AclData
+    todo("probe.received_acl")
+
+// A frame this device is about to send.
+fn outbound() -> L2capFrame
+    todo("probe.outbound")
+
+fn main() [hw, time]
+    // The framing arithmetic, which is what a receive path spends its
+    // time in.
+    match l2cap.scan(received_payload())
+        L2capPartial  => hal.uart.write("l2cap-nv: partial\n")
+        L2capWhole(_) => hal.uart.write("l2cap-nv: whole frame\n")
+
+    // The channel demux: an Int in, a dispatch out.
+    match l2cap.channel_of(l2cap.CID_ATT)
+        AttributeChannel       => hal.uart.write("l2cap-nv: att\n")
+        SignallingChannel      => hal.uart.write("l2cap-nv: signalling\n")
+        SecurityManagerChannel => hal.uart.write("l2cap-nv: smp\n")
+        DynamicChannel(_)      => hal.uart.write("l2cap-nv: dynamic\n")
+        ForeignChannel(_)      => hal.uart.write("l2cap-nv: foreign\n")
+
+    // Reassembly, driven the way a controller drives it: the boundary
+    // is in a register and the payload is in a buffer, so nothing is
+    // allocated to pass them.
+    var r: L2capReassembler = l2cap.reassembler_with_mtu(23)
+    let step: L2capStep = l2cap.feed_payload(r, FirstFlushable, received_payload())
+    r = step.reassembler
+    match step.frame
+        None    => hal.uart.write(".")
+        Some(_) => hal.uart.write("!")
+    match step.error
+        None    => hal.uart.write("-")
+        Some(_) => hal.uart.write("?")
+
+    // The `AclData`-taking half, which is what a host stack uses.
+    let host_step: L2capStep = l2cap.feed_acl(r, received_acl())
+    r = host_step.reassembler
+    if l2cap.pending_len(r) > l2cap.mtu(r)
+        hal.uart.write("l2cap-nv: over budget\n")
+
+    // And one decode, so the Result-returning half of the surface is
+    // compiled for the device too rather than only the total functions.
+    let decoded: Result<L2capFrame, L2capError> = l2cap.decode_frame(received_payload())
+    match decoded
+        Err(_) => hal.uart.write("l2cap-nv: bad frame\n")
+        Ok(_)  => hal.uart.write("l2cap-nv: frame\n")
+
+    // Fragmentation, which is the other direction and the one that has
+    // to size a buffer without one.
+    let packets = l2cap.fragment(outbound(), 0x0040, 27)
+    if list.len(packets) > 1
+        hal.uart.write("l2cap-nv: split\n")
+
+    loop
+        core.rt.sleep_ms(1000)
