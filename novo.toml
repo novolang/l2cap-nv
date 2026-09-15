@@ -1,6 +1,6 @@
 [package]
 name        = "l2cap-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "The Bluetooth L2CAP layer with no radio: basic-mode frames to and from bytes, the LE fixed channels, reassembly of a frame split across ACL packets, and the signalling commands a peripheral meets.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
